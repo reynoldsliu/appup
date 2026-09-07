@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""usage: appup <command> [category]
+
+commands:   list | outdated | upgrade | help | selftest
+categories: brew | formula | cask | store | npm | pipx | manual
+
+Run `appup help` for details. Stdlib only; missing tools are skipped silently.
+"""
+import glob
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# Apps/tools known to be end-of-life or abandoned: flag hard if seen.
+EOL = {"python 2", "anaconda2", "adobe flash player"}
+
+ALIASES = {
+    "formula": {"brew formula"},
+    "cask": {"brew cask"},
+    "brew": {"brew formula", "brew cask"},
+    "store": {"app store"},
+    "npm": {"npm global"},
+    "pipx": {"pipx"},
+    "manual": {"manual .app"},
+}
+
+HELP = """appup — categorized Mac app inventory + update helper
+
+usage: appup <command> [category]
+
+commands:
+  list [category]      full inventory, grouped by install method (read-only)
+  outdated [category]  only items needing attention (read-only)
+  upgrade [category]   show upgrade commands, confirm once, run them
+  help                 this text
+  selftest             run built-in assertions over the parsing logic
+
+categories (optional filter):
+  brew      Homebrew formulae + casks
+  formula   Homebrew formulae only
+  cask      Homebrew casks only
+  store     Mac App Store apps (needs mas)
+  npm       npm global packages
+  pipx      pipx-installed Python tools
+  manual    .apps installed by hand (dmg/zip)
+
+examples:
+  appup list manual        list manually installed apps
+  appup list brew,npm      combine categories with commas
+  appup outdated npm       outdated npm globals only
+  appup outdated manual    review manual apps; offers a Homebrew-catalog check
+  appup upgrade brew       upgrade Homebrew packages only
+  appup upgrade manual     update catalog-matched manual apps via brew
+                           (brew replaces the .app and manages it from then on)
+
+tab completion (zsh): add this line to ~/.zshrc
+  eval "$(appup completion)"
+
+markers: ⚠️ outdated   🚨 major version gap or end-of-life"""
+
+# zsh completion. The compdef guard matters: without compinit loaded first,
+# compdef fails silently and zsh falls back to completing filenames.
+COMPLETION = """(( $+functions[compdef] )) || { autoload -Uz compinit && compinit -i; }
+_appup() {
+  if (( CURRENT == 2 )); then
+    _values 'command' list outdated upgrade help selftest completion
+  elif (( CURRENT == 3 )); then
+    case $words[2] in
+      list|outdated|upgrade)
+        _values 'category' brew formula cask store npm pipx manual ;;
+    esac
+  fi
+}
+compdef _appup appup"""
+
+
+def run(cmd, ok_codes=(0,)):
+    """Run cmd, return stdout, or None if the tool is missing or errors."""
+    try:
+        # ponytail: 300s guards against a wedged package manager hanging us
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout if p.returncode in ok_codes else None
+
+
+def item(name, version, latest, category):
+    return {"name": name, "version": version, "latest": latest, "category": category}
+
+
+# ---------- sources: each returns [{name, version, latest, category}] ----------
+
+def brew_items():
+    out = run(["brew", "outdated", "--json=v2"])
+    if out is None:
+        return []
+    od = json.loads(out)
+    latest = {f["name"]: f["current_version"] for f in od.get("formulae", [])}
+    latest |= {c["name"]: c["current_version"] for c in od.get("casks", [])}
+    items = []
+    for kind, category in (("--formula", "brew formula"), ("--cask", "brew cask")):
+        out = run(["brew", "list", kind, "--versions"]) or ""
+        for line in out.splitlines():
+            name, _, version = line.partition(" ")
+            items.append(item(name, version, latest.get(name), category))
+    return items
+
+
+def parse_mas_line(line):
+    """'497799835  Xcode  (14.2)' or '... (14.2 -> 14.3)' -> (name, ver, latest)."""
+    m = re.match(r"\s*\d+\s+(.+?)\s+\((\S+)(?:\s*->\s*(\S+))?\)\s*$", line)
+    return (m.group(1), m.group(2), m.group(3)) if m else None
+
+
+def mas_items():
+    out = run(["mas", "list"])
+    if out is None:
+        return []
+    latest = {}
+    for line in (run(["mas", "outdated"]) or "").splitlines():
+        p = parse_mas_line(line)
+        if p:
+            latest[p[0]] = p[2]
+    items = []
+    for line in out.splitlines():
+        p = parse_mas_line(line)
+        if p:
+            items.append(item(p[0], p[1], latest.get(p[0]), "app store"))
+    return items
+
+
+def npm_items():
+    out = run(["npm", "ls", "-g", "--json", "--depth=0"])
+    if out is None:
+        return []
+    # npm outdated exits 1 when anything is outdated
+    od = json.loads(run(["npm", "outdated", "-g", "--json"], ok_codes=(0, 1)) or "{}")
+    items = []
+    for name, info in json.loads(out).get("dependencies", {}).items():
+        items.append(item(name, info.get("version", "?"),
+                          od.get(name, {}).get("latest"), "npm global"))
+    return items
+
+
+def pipx_items():
+    out = run(["pipx", "list", "--json"])
+    if out is None:
+        return []
+    # ponytail: pipx exposes no "latest" info; upgrade-all covers it blindly
+    return [item(name, v["metadata"]["main_package"]["package_version"], None, "pipx")
+            for name, v in json.loads(out).get("venvs", {}).items()]
+
+
+def manual_app_items():
+    out = run(["system_profiler", "SPApplicationsDataType", "-json"])
+    if out is None:
+        return []
+    cask_apps = {p.rsplit("/", 1)[-1].removesuffix(".app").lower()
+                 for prefix in ("/opt/homebrew", "/usr/local")
+                 for p in glob.glob(f"{prefix}/Caskroom/*/*/*.app")}
+    mas_apps = {i["name"].lower() for i in mas_items()}
+    items = []
+    for app in json.loads(out).get("SPApplicationsDataType", []):
+        name, path = app.get("_name", "?"), app.get("path", "")
+        # ponytail: /Applications-only filter drops embedded helpers and droplets
+        if not path.startswith(("/Applications/", f"{Path.home()}/Applications/")):
+            continue
+        if (app.get("obtained_from") == "apple" or path.startswith("/System")
+                or name.lower() in cask_apps
+                or app.get("obtained_from") == "mac_app_store"
+                or name.lower() in mas_apps):
+            continue
+        items.append(item(name, app.get("version", "?"), None, "manual .app")
+                     | {"path": path})
+    return items
+
+
+def all_items():
+    return (brew_items() + mas_items() + npm_items() + pipx_items()
+            + manual_app_items())
+
+
+# ---------- manual .app <-> Homebrew cask catalog ----------
+
+CASK_DB = Path.home() / "Library/Caches/Homebrew/api/cask.jws.json"
+
+
+def build_names(casks):
+    """Cask list -> {display name (lower): (token, version, app filenames)}.
+
+    Exact display-name matches only — a wrong match is worse than no match.
+    Plain tokens beat @variants (ghostty over ghostty@tip). App filenames are
+    kept so callers can reject same-name-different-app collisions
+    (MacPaw's Gemini vs Google's Gemini).
+    """
+    names = {}
+    for c in casks:
+        tok, ver = c.get("token", ""), c.get("version", "")
+        apps = frozenset(a.lower() for art in c.get("artifacts", [])
+                         for a in art.get("app", []) if isinstance(a, str))
+        for n in c.get("name", []):
+            k = n.lower()
+            if k not in names or ("@" in names[k][0] and "@" not in tok):
+                names[k] = (tok, ver, apps)
+    return names
+
+
+def cask_catalog():
+    """Read brew's local API cache — no network. Empty dict if unavailable."""
+    try:
+        return build_names(json.loads(json.loads(CASK_DB.read_text())["payload"]))
+    except (OSError, ValueError, KeyError):
+        return {}
+
+
+def vkey(version):
+    """'1.2.94.583,g4f94' -> [1, 2, 94, 583]; None when not comparable."""
+    m = re.match(r"[\d.]+", (version or "").split(",")[0])
+    return [int(x) for x in m.group(0).split(".") if x] if m else None
+
+
+def check_manual(items):
+    """Fill latest/token on manual items the cask catalog says are outdated."""
+    catalog = cask_catalog()
+    matched = []
+    for it in items:
+        tok, ver, apps = catalog.get(it["name"].lower(), (None, None, ()))
+        appfile = it.get("path", "").rsplit("/", 1)[-1].lower()
+        if apps and appfile not in apps:  # same name, different app: reject
+            continue
+        cur, new = vkey(it["version"]), vkey(ver)
+        # only flag when the cask is strictly newer — casks can lag installs
+        if tok and cur and new and new > cur:
+            it["latest"], it["token"] = ver, tok
+            matched.append(it)
+    return matched
+
+
+# ---------- categories / flags / display ----------
+
+def resolve(arg):
+    """'brew,npm' -> set of category names, or exit with the valid list."""
+    cats = set()
+    for alias in arg.split(","):
+        if alias not in ALIASES:
+            sys.exit(f"unknown category '{alias}' — valid: {' | '.join(ALIASES)}")
+        cats |= ALIASES[alias]
+    return cats
+
+
+def select(items, cats):
+    return [i for i in items if cats is None or i["category"] in cats]
+
+
+def major(version):
+    m = re.match(r"(\d+)", version or "")
+    return int(m.group(1)) if m else None
+
+
+def flag(it):
+    if it["name"].lower() in EOL:
+        return "🚨 EOL"
+    latest = it["latest"]
+    if latest and latest != it["version"]:
+        cur, new = major(it["version"]), major(latest)
+        return "🚨 major gap" if cur is not None and new is not None and new > cur \
+            else "⚠️ outdated"
+    return ""
+
+
+def show(items):
+    for category in sorted({i["category"] for i in items}):
+        print(f"\n== {category} ==")
+        for it in sorted((i for i in items if i["category"] == category),
+                         key=lambda i: i["name"].lower()):
+            line = f"  {it['name']}  {it['version']}"
+            if it["latest"] and it["latest"] != it["version"]:
+                line += f" -> {it['latest']}"
+            f = flag(it)
+            print(f"{line}  {f}" if f else line)
+
+
+# ---------- commands ----------
+
+def cmd_list(cats):
+    show(select(all_items(), cats))
+
+
+def ask(question):
+    """y/N prompt; EOF (piped or scheduled runs) counts as N."""
+    try:
+        return input(question).strip().lower() == "y"
+    except EOFError:
+        return False
+
+
+def cmd_outdated(cats):
+    # manual .apps have no registry: only shown when explicitly asked for
+    manual_wanted = cats is not None and "manual .app" in cats
+    check = manual_wanted and ask(
+        "Check manual .apps against Homebrew's cask catalog "
+        "(local file, exact name matches only)? [y/N] ")
+    items = select(all_items(), cats)
+    if check:
+        n = len(check_manual([i for i in items
+                              if i["category"] == "manual .app"]))
+        print(f"{n} manual .app(s) have a newer version in the catalog.")
+    out = [i for i in items
+           if flag(i) or (manual_wanted and i["category"] == "manual .app")]
+    if not out:
+        print("Everything up to date.")
+        return
+    show(out)
+    if any(i["category"] == "manual .app" for i in out):
+        print("\n(matched apps show an arrow and can be updated with "
+              "`appup upgrade manual`; the rest self-update or need a "
+              "manual check)")
+    elif cats is None and any(i["category"] == "manual .app" for i in items):
+        print("\n(manual .apps not checked — run `appup outdated manual` "
+              "to review them)")
+
+
+def upgrade_cmds(cats):
+    def want(c):
+        return cats is None or c in cats
+    cmds = []
+    if want("brew formula") and want("brew cask"):
+        cmds.append(["brew", "upgrade"])
+    elif want("brew formula"):
+        cmds.append(["brew", "upgrade", "--formula"])
+    elif want("brew cask"):
+        cmds.append(["brew", "upgrade", "--cask"])
+    if want("app store"):
+        cmds.append(["mas", "upgrade"])
+    if want("npm global"):
+        cmds.append(["npm", "update", "-g"])
+    if want("pipx"):
+        cmds.append(["pipx", "upgrade-all"])
+    return [c for c in cmds if run([c[0], "--version"]) is not None]
+
+
+def cmd_upgrade(cats):
+    cmds = upgrade_cmds(cats)
+    if cats is not None and "manual .app" in cats:
+        manual = manual_app_items()
+        tokens = sorted(i["token"] for i in check_manual(manual))
+        if tokens:
+            print(f"{len(tokens)} manual .app(s) match a newer Homebrew cask. "
+                  "brew will download, verify, and REPLACE them (quit them "
+                  "first); afterwards brew manages their updates.")
+            print("  " + " ".join(tokens))
+            try:
+                pick = input("Enter to include all, or type the ones to "
+                             "update (space-separated): ").split()
+            except EOFError:
+                pick = []
+            if pick:
+                bad = sorted(set(pick) - set(tokens))
+                if bad:
+                    sys.exit(f"not in the matched list: {' '.join(bad)}")
+                tokens = pick
+            cmds.append(["brew", "install", "--cask", "--force"] + tokens)
+        else:
+            print("No manual .app matches a newer cask — the rest self-update "
+                  "or need a manual download.")
+    if not cmds:
+        return
+    print("Will run:")
+    for c in cmds:
+        print("  " + " ".join(c))
+    if not ask("Proceed? [y/N] "):
+        print("Aborted.")
+        return
+    for c in cmds:
+        print(f"\n$ {' '.join(c)}")
+        subprocess.run(c)
+
+
+def cmd_selftest():
+    assert parse_mas_line("497799835  Xcode  (14.2)") == ("Xcode", "14.2", None)
+    assert parse_mas_line("1 Slack (4.35 -> 4.36)") == ("Slack", "4.35", "4.36")
+    assert parse_mas_line("garbage") is None
+    assert major("14.2.1") == 14 and major("?") is None
+    assert flag(item("x", "1.2", "2.0", "c")) == "🚨 major gap"
+    assert flag(item("x", "1.2", "1.3", "c")) == "⚠️ outdated"
+    assert flag(item("x", "1.2", None, "c")) == ""
+    assert flag(item("Adobe Flash Player", "32", None, "c")) == "🚨 EOL"
+    assert resolve("brew") == {"brew formula", "brew cask"}
+    assert resolve("manual") == {"manual .app"}
+    assert resolve("npm,pipx") == {"npm global", "pipx"}
+    assert resolve("brew,manual") == {"brew formula", "brew cask", "manual .app"}
+    sample = [item("a", "1", None, "pipx"), item("b", "1", None, "npm global")]
+    assert select(sample, {"pipx"}) == [sample[0]]
+    assert select(sample, None) == sample
+    assert vkey("6.1") > vkey("6.0")
+    assert vkey("1.5.12") < vkey("1.12.7")
+    assert vkey("1.2.94.583,g4f94bf0d") == [1, 2, 94, 583]
+    assert vkey("abc") is None and vkey(None) is None
+    fake = [{"token": "ghostty@tip", "version": "9", "name": ["Ghostty"]},
+            {"token": "ghostty", "version": "2", "name": ["Ghostty"]}]
+    assert build_names(fake)["ghostty"][:2] == ("ghostty", "2")
+    assert build_names(reversed(fake))["ghostty"][:2] == ("ghostty", "2")
+    older = [item("Steam", "6.1", None, "manual .app")
+             | {"path": "/Applications/Steam.app"}]
+    fake_cat = {"steam": ("steam", "6.0", frozenset({"steam.app"}))}
+    import unittest.mock as mock
+    with mock.patch(f"{__name__}.cask_catalog", lambda: fake_cat):
+        assert check_manual(older) == []  # installed newer than cask: no flag
+        fake_cat["steam"] = ("steam", "6.2", frozenset({"steam.app"}))
+        assert check_manual(older) == older and older[0]["token"] == "steam"
+        # same display name but a different .app bundle: must not match
+        impostor = [item("Steam", "1.0", None, "manual .app")
+                    | {"path": "/Applications/Steam 2.app"}]
+        assert check_manual(impostor) == []
+    print("ok")
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "help"
+    cats = resolve(args[1]) if len(args) > 1 else None
+    if cmd == "help":
+        print(HELP)
+    elif cmd == "completion":
+        print(COMPLETION)
+    elif cmd == "selftest":
+        cmd_selftest()
+    elif cmd in ("list", "outdated", "upgrade"):
+        {"list": cmd_list, "outdated": cmd_outdated, "upgrade": cmd_upgrade}[cmd](cats)
+    else:
+        print(__doc__.strip())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
