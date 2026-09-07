@@ -13,6 +13,21 @@ macOS spreads your software across five or six package managers that don't know 
 - **zsh tab completion**, multi-category filters, and a built-in selftest
 - Single Python file, standard library only, no dependencies
 
+## Sample output
+
+```
+$ appup outdated
+
+== brew formula ==
+  aom  3.14.1 -> 3.15.0  ⚠️ outdated
+  ca-certificates  2026-07-16 -> 2026-08-13  ⚠️ outdated
+
+== manual .app ==
+  Steam  6.1 -> 6.2  ⚠️ outdated
+```
+
+Add `--json` to `list`/`outdated` for machine-readable output (no prompts — safe for scripts and cron).
+
 ## Requirements
 
 - macOS with Python 3.9+ (the system `python3` from Xcode Command Line Tools is fine)

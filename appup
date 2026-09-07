@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """usage: appup <command> [category]
 
-commands:   list | outdated | upgrade | help | selftest
+commands:   list | outdated | upgrade | help | selftest   (list/outdated: --json)
 categories: brew | formula | cask | store | npm | pipx | manual
 
 Run `appup help` for details. Stdlib only; missing tools are skipped silently.
@@ -32,6 +32,7 @@ usage: appup <command> [category]
 
 commands:
   list [category]      full inventory, grouped by install method (read-only)
+                       add --json for machine-readable output
   outdated [category]  only items needing attention (read-only)
   upgrade [category]   show upgrade commands, confirm once, run them
   help                 this text
@@ -284,8 +285,14 @@ def show(items):
 
 # ---------- commands ----------
 
-def cmd_list(cats):
-    show(select(all_items(), cats))
+def to_json(items):
+    return json.dumps([i | {"flag": flag(i)} for i in items],
+                      ensure_ascii=False, indent=2)
+
+
+def cmd_list(cats, as_json=False):
+    items = select(all_items(), cats)
+    print(to_json(items)) if as_json else show(items)
 
 
 def ask(question):
@@ -296,9 +303,15 @@ def ask(question):
         return False
 
 
-def cmd_outdated(cats):
+def cmd_outdated(cats, as_json=False):
     # manual .apps have no registry: only shown when explicitly asked for
     manual_wanted = cats is not None and "manual .app" in cats
+    if as_json:  # machine mode: no prompts, no hints — just the data
+        items = select(all_items(), cats)
+        if manual_wanted:
+            check_manual([i for i in items if i["category"] == "manual .app"])
+        print(to_json([i for i in items if flag(i)]))
+        return
     check = manual_wanted and ask(
         "Check manual .apps against Homebrew's cask catalog "
         "(local file, exact name matches only)? [y/N] ")
@@ -419,6 +432,8 @@ def cmd_selftest():
 
 def main():
     args = sys.argv[1:]
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
     cmd = args[0] if args else "help"
     cats = resolve(args[1]) if len(args) > 1 else None
     if cmd == "help":
@@ -427,8 +442,10 @@ def main():
         print(COMPLETION)
     elif cmd == "selftest":
         cmd_selftest()
-    elif cmd in ("list", "outdated", "upgrade"):
-        {"list": cmd_list, "outdated": cmd_outdated, "upgrade": cmd_upgrade}[cmd](cats)
+    elif cmd == "upgrade":
+        cmd_upgrade(cats)
+    elif cmd in ("list", "outdated"):
+        {"list": cmd_list, "outdated": cmd_outdated}[cmd](cats, as_json)
     else:
         print(__doc__.strip())
         sys.exit(1)
