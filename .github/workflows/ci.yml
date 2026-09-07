@@ -6,4 +6,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./appup selftest
-      - run: python3 test_cli.py
+      # non-interactive smoke on a clean runner; test_cli.py needs a real Mac
+      # with manual .apps + cask catalog, so it stays a local integration test
+      - run: ./appup help
+      - run: ./appup list --json > /dev/null
+      - run: ./appup outdated --json > /dev/null

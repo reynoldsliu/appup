@@ -28,6 +28,13 @@ $ appup outdated
 
 Add `--json` to `list`/`outdated` for machine-readable output (no prompts — safe for scripts and cron).
 
+## Tests
+
+```bash
+./appup selftest      # unit assertions over the parsing logic (runs in CI)
+python3 test_cli.py   # pty integration test: needs a real Mac with manual .apps installed
+```
+
 ## Requirements
 
 - macOS with Python 3.9+ (the system `python3` from Xcode Command Line Tools is fine)
