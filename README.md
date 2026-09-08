@@ -1,17 +1,32 @@
 # appup
 
-One command to see every app on your Mac — grouped by how it was installed — and to know which ones are out of date.
+**One command to see every app on your Mac and which ones are out of date.**
 
-macOS spreads your software across five or six package managers that don't know about each other. `appup` asks all of them, merges the answers, and tells you what needs attention. It is read-only by default: nothing on your system changes unless you run `upgrade` and explicitly confirm.
+Your Mac software lives in five or six different places that don't talk to each other:
+Homebrew, the App Store, npm, pipx, and whatever you dragged into `/Applications` from a `.dmg`.
+Each has its own way to check for updates — so most people just… don't, and quietly run
+year-old software.
 
-## Features
+`appup` asks all of them, merges the answers, and shows you one list.
 
-- **Inventory** — every app, categorized by install method: Homebrew formulae and casks, Mac App Store, npm globals, pipx tools, and hand-installed `.app` bundles
-- **Outdated report** — what has a pending update, with severity markers for major-version gaps and end-of-life software
-- **One-confirmation upgrades** — per category or all at once, always shown before run
-- **Manual-app rescue** — matches hand-installed apps against Homebrew's cask catalog (a local file, no network) and can hand them over to Homebrew for updating
-- **zsh tab completion**, multi-category filters, and a built-in selftest
-- Single Python file, standard library only, no dependencies
+```bash
+appup outdated        # what needs attention?
+appup upgrade brew    # apply Homebrew updates, touch nothing else
+appup list manual     # what did I install by hand?
+```
+
+**It is read-only by default.** Nothing on your system changes unless you run `upgrade`,
+see the exact commands, and type `y`.
+
+## What it does
+
+- **Full inventory** — every app, grouped by how it got installed
+- **Outdated report** — with louder markers for major-version gaps and end-of-life software
+- **Upgrades with one confirmation** — per category or all at once, commands always shown first
+- **Rescues hand-installed apps** — matches them against Homebrew's local catalog, and can hand
+  them over to Homebrew so future updates are automatic
+- **`--json` output** for scripts and cron, zsh tab completion, and a built-in selftest
+- **One Python file. Standard library only. No dependencies, no config, no daemon.**
 
 ## Sample output
 
